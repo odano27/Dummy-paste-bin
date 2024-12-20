@@ -1,0 +1,125 @@
+# Record which material and load case to run
+declare -a material_dir
+declare -a loadcases
+declare -a materials
+declare -a geometries
+declare -a modes
+
+N=0
+
+while IFS= read -r line
+do
+    # Skip commented lines
+    if [[ ${line:0:1} != "#" ]]
+    then
+        # Split the line into an array based on spaces
+        IFS=' ' read -a temp <<< "$line"
+        
+        # Increment the simulation count
+        N=$((N+1))
+        
+        # Populate arrays with configuration parameters
+        material_dir+=("${temp[0]}")
+        loadcase=("${temp[1]}")
+        
+        # Ensure the load case filename ends with .yaml
+        if [ "${loadcase: -5}" != ".yaml" ]; then
+            loadcase=("${loadcase}.yaml")
+        fi
+        loadcases+=("${loadcase}")
+        modes+=("${temp[2]}")
+        
+        # Define the material directory
+        dir="./materials_quang/${temp[0]}/"
+        
+        # Locate the geometry (.vti) file
+        search_file="$(find "$dir" -type f -name '*.vti')"
+        geom=("${search_file#"$dir"}")
+        geometries+=("$geom")
+        
+        # Locate the material (.yaml) file
+        search_file="$(find "$dir" -type f -name '*.yaml')"
+        mat=("${search_file#"$dir"}")
+        materials+=("$mat")
+        
+        # Define the simulation directory name
+        sim_dir_name="${temp[0]}_${loadcase%.*}"
+        
+        # Create the simulation directory within a job-specific folder
+        sim_base_dir="./simulations/job_${SLURM_JOB_ID}"
+        sim_path="${sim_base_dir}/${sim_dir_name}"
+        
+        # Create the base job directory if it doesn't exist
+        mkdir -p "$sim_path"
+        
+        # Copy necessary files into the simulation directory
+        cp "./materials_quang/${temp[0]}/$mat" "$sim_path/"
+        cp "./materials_quang/${temp[0]}/$geom" "$sim_path/"
+        cp "./loadcases_quang/$loadcase" "$sim_path/"
+    fi
+done < "$file"
+
+
+export project_dir=$PWD
+echo "=== Running ${N} simulations ==="
+# Run simulations
+export PATH="$PWD/damask_tykky/bin:$PATH"
+for ((n=0; n<N; n++))
+do
+    # Extract simulation parameters from arrays
+    mat_dir="${material_dir[n]}"
+    mat="${materials[n]}"
+    load="${loadcases[n]}"
+    geom="${geometries[n]}"
+    mode="${modes[n]}"
+    
+    # Define the simulation path
+    sim_dir_name="${mat_dir}_${load%.*}"
+    sim_base_dir="./simulations/job_${SLURM_JOB_ID}"
+    sim_path="${sim_base_dir}/${sim_dir_name}"
+    
+    echo "=== Running simulation for Material: ${mat_dir}, Load: ${load}, Job ID: ${SLURM_JOB_ID} ==="
+    
+    # Run the simulation using Apptainer (Srun is used for SLURM compatibility)
+    srun apptainer run --env OMP_NUM_THREADS=${OMP_NUM_THREADS} DAMASK_grid.sif \
+        -w "${project_dir}/${sim_path}" \
+        -m "$mat" \
+        -l "$load" \
+        -g "$geom" \
+        -j "${mat_dir}_${load%.*}" > "${sim_path}/log.out"
+        
+    # Optional: Check if the simulation was successful
+    if [ $? -ne 0 ]; then
+        echo "Simulation for ${sim_dir_name} failed. Check ${sim_path}/log.out for details."
+    else
+        echo "Simulation for ${sim_dir_name} completed successfully."
+    fi
+
+    # Extract simulation parameters from arrays
+    mat_dir="${material_dir[n]}"
+    mat="${materials[n]}"
+    load="${loadcases[n]}"
+    geom="${geometries[n]}"
+    mode="${modes[n]}"
+    
+    # Define the simulation path
+    sim_dir_name="${mat_dir}_${load%.*}"
+    sim_base_dir="./simulations/job_${SLURM_JOB_ID}"
+    sim_path="${sim_base_dir}/${sim_dir_name}"
+    
+    echo "Running post-processing for ${sim_dir_name} with mode ${mode}"
+    
+    # Execute the post-processing Python script in the background
+    python3 postprocessing.py -m "$mode" -p "${sim_path}/${mat_dir}_${load%.*}.hdf5" > "${sim_path}/py_postprocessing.out" 2>&1 &
+    wait
+    echo "Finished post-processing"
+    ### Uncomment below to delete hdf5 files
+    # rm "${sim_path}/${mat_dir}_${load%.*}.hdf5" 
+    if [ $? -ne 0 ]; then
+        echo "Failed to delete HDF5 file for ${sim_dir_name}."
+    else
+        echo "Deleted HDF5 file for ${sim_dir_name}."
+    fi
+done
+wait
+echo "Finished post-processing"
